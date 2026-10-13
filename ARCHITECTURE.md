@@ -381,13 +381,14 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 
 旧 `recover()` / `recover_session()` 已删除；现在的面：
 
-- `rebuild_session(session_id)`（`core/runtime.py:2173`，**唯一的按需装填入口**）/ `rebuild_hitl(session_id)`（`:4540`）。两条都走 `rebuild_view` 的快照 + 增量，O(delta)。
+- `rebuild_session(session_id)`（`core/runtime.py`，**统一的按需冷准备入口**）在 per-session 锁内只回放一次 `rebuild_view`（快照 + 增量），顺序装填 HITL、ALM、校准冷 `running` agent 为 `interrupted`，再建立 TaskManager。`restore(..., enqueue=False)` 保留任务状态且不入队，owner 准备完整后才发布；不启动 drain、recap 或模型请求。`strict=True` 让准备失败直接抛出。已有活 owner 时不回放、不替换。单独的 `rebuild_hitl(session_id)` 仍可用于 HITL 查询。
 - **「有哪些会话」不是 core 的问题**（2026-09-21）。host 建的会话、host 的会话表和状态列，它自己就有清单；core 从事件流反推是职责倒置。于是同日删掉三件互相支撑的东西：按 agent 的 sweep（`rebuild_agent` / `rebuild_all_agents`）、按会话枚举的 `rebuild_all_pending_hitl`、以及它们共用的 `EventStore.list_active_session_ids` 与 `providers/events/_lifecycle` 那台判据状态机。
 - 现在 registry miss 的行为：给了 `session_id` 就精确装填那一条，没给就抛 `AgentNotLoaded`（`AgentNotFound` 的子类）。host 要按会话装填，拿自己的清单逐条调上面两个方法。
 - 附带解掉的坑：那台状态机的两条 discard 依据（`SessionFinished` / `SessionStatusChanged`）在 src 下**没有任何 emit 调用点**，判据恒真 = 历史全部会话。谁去「修」它让 discard 生效，`rebuild_all_pending_hitl` 就会开始漏 HITL（`TERMINAL_STATUSES` 含 `INTERRUPTED`，而被打断的会话完全可能正停在那儿等人回答）。判据没了，这个反向依赖也没了。
-- `recover_agent(agent_id, ...)`（`core/runtime.py:2130`；per-session resume 锁 `:719`）→ `_recover_session_locked`（`:2210`），**单 owner 架构**（session 的 TaskManager 是单例：`_bind_task_manager` 是唯一写 `_task_managers` 的地方，已有别的 TM 在册即抛）：
-  - 内存里有活 owner TM → `_recover_in_existing_tm`（`:2528`）就地续跑、**绝不重建**：冷 HITL 应答走 `_resume_in_existing_tm`（`:2579`）重排被应答的 task；`/resume` 走 `TaskManager.requeue_resumable`（判据同 `restore()`，读内存）；
-  - 内存里没有 TM（进程重启 / 从未建过 / 已被 forget·purge 逐出）→ `rebuild_view`（`core/control/reducers.py:351`，快照+增量 `read_range`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:156`，跳过已废弃的 compact/metadata ephemeral task `:197`）→ `_load_agents_of` 装填 ALM（`:3644`）→ set_runner + `_register_and_drain` 续跑。
+- `recover_agent(agent_id, ...)` → `_recover_session_locked`（均在 `core/runtime.py`），**单 owner 架构**（session 的 TaskManager 是单例：`_bind_task_manager` 是唯一写 `_task_managers` 的地方，已有别的 TM 在册即抛）：
+  - 缺 owner 时先调用 `_rebuild_session_locked` 完成上述统一冷准备。`keep_alive=True` 到此返回，不激活任务或做续跑收尾；`prepare_agent` 也是统一冷准备的兼容包装。
+  - owner 已就绪 → `_recover_in_existing_tm` 就地续跑：冷 HITL 应答先注入输入，再由 `_resume_in_existing_tm` 重排被应答的 task；`/resume` 走 `TaskManager.requeue_resumable`（读内存）。首次激活由 `_activate_prepared_tasks_locked` 完成补注入、依赖清理和 recap，然后 `_register_and_drain` 启动执行；未答复的 HITL 保持 parked，正在运行的 task 不重排。
+  - `send_message` 同样在判断旧任务是否终态**之前**确保 owner 已准备好；非终态注入旧任务，终态才创建新任务，输入交付后激活并 drain。缺 owner 抛准备错误，不能当作旧任务已结束。
 
 ### 取消 / 暂停
 

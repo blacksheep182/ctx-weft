@@ -513,8 +513,8 @@ runtime = CtxWeftRuntime(
 | `run_single_task(...)` | 单任务端到端，**等待完成** | `(RunHandle, LoopState)` |
 | `start_session(params)` | 新建会话，多 agent 编排，**异步后台跑** | `RunHandle` |
 | `start_session(params)`（带 `session_id`） | 恢复已有会话续跑 | `RunHandle` |
-| `rebuild_session(id)` | 把一条冷会话装填回内存（**只装填，不跑**） | `int` |
-| `recover_agent(agent_id)` | 续跑一个被打断的 agent（装填 + 建 TM + drain） | `None` |
+| `rebuild_session(id)` | 装填冷会话的 HITL、agent 与 TaskManager（**只装填，不跑**） | `int` |
+| `recover_agent(agent_id)` | 复用准备好的 owner，激活任务并 drain（缺 owner 时先统一冷准备） | `None` |
 | `interrupt_session(id)` | 协作式取消正在跑的 session | `bool` |
 
 ### run_single_task() — 单任务直跑
@@ -589,14 +589,20 @@ compact 由 ReasonStep 命中阈值后内联直调 CompactStep；metadata_filler
 `runtime.recover()` 已于 2026-09-09 删除（它的活跃判据只增不减，开销与历史会话数线性增长且永不收敛）。
 
 ```python
-# ① 装填：把一条冷会话的内存态喂回来。只读事件日志，**不建 TaskManager、不跑任何东西**。
-#    幂等，随便调。进程重启后、或宿主的 LRU 把它逐出（forget_session）之后，都用这条拉回来。
-n = await runtime.rebuild_session(session_id)      # 返回装填的 agent 条数
+# ① 装填：回放一次事件，恢复 HITL、agent 和 TaskManager；不入队、不执行任务。
+#    冷启动残留的 running agent 会校准为 interrupted，并记录该状态转移。
+#    strict=True 将准备失败直接交给调用方；已有活 owner 时复用，不重复回放。
+n = await runtime.rebuild_session(session_id, strict=True)  # 返回装填的 agent 条数
 
 # ② 之后才谈操作这条会话里的 agent：
 await runtime.send_message(agent_id, "继续", session_id=session_id)   # 接着聊
 await runtime.recover_agent(agent_id)                                 # 续跑被打断的
 ```
+
+`rebuild_session` 中的 `TaskManager.restore(..., enqueue=False)` 保留持久化任务状态，
+队列保持为空，不补注入答复、不启动 recap，也不调用模型。发送消息先用准备好的 owner
+判断旧任务是否终态，交付输入后才激活并 drain；显式恢复也复用同一个 owner。
+`waiting_human` 不会被冷重建改成 `interrupted`，未答复的 HITL 仍保持等待。
 
 ⚠️ **顺序不能反。** agent record 是只增不删的**缓存**，一次 miss 只说明「还没喂进来」，事实一直在事件日志里。
 但 core 不会替你去找那条会话——事件按 session 分区存，`agent_id` 没有反向索引，「只有 agent_id」时唯一的找法

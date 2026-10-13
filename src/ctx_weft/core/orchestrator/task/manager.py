@@ -179,12 +179,18 @@ class TaskManager:
         all_tasks: list[Task],
         terminal_ids: set[str],
         parked_task_ids: set[str] | None = None,
+        *,
+        enqueue: bool = True,
     ) -> None:
         """Rebuild task registry and re-queue resumable tasks after a crash.
 
         ``parked_task_ids``: tasks with an unresolved pending HITL (spec/07 §9.1) —
         SUSPENDED but must STAY parked (not re-queued) until ``/answer`` resumes them.
         Empty/None → legacy behavior.
+
+        ``enqueue=False`` loads the registry and dependency/child indexes only.
+        Persisted statuses remain unchanged; the caller later requeue_resumable()
+        after delivering input. No tasks can run during preparation.
 
         挂在**已终局** HITL 上的 task 不需要在这里另开一条重排口子：ACTIVE 的走下面的
         ``else`` 分支、SUSPENDED 且子任务都终态的走 children 闸门、SUSPENDED 且尚有活
@@ -210,6 +216,8 @@ class TaskManager:
         # 未落盘的崩溃窗口正是靠那一趟兜底）。
         succeeded_ids = {t.id for t in all_tasks if t.status == "FINISHED"}
         self._queue.seed_succeeded(succeeded_ids)
+        if not enqueue:
+            return
 
         for t in all_tasks:
             if t.status in TERMINAL_TASK_STATUSES:

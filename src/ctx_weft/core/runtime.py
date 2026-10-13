@@ -759,6 +759,9 @@ class CtxWeftRuntime:
         # compact 等一次性操作的忙位（原先借 _cancel_tokens dict 占位）。
         self._busy_sessions: set[str] = set()
         self._task_managers: dict[str, TaskManager] = {}
+        # Cold owners are loaded without a queue. Recovery work starts only after
+        # the caller has delivered its input; this is not an agent/task status.
+        self._prepared_recoveries: dict[str, tuple[TaskManager, int, dict]] = {}
         # 会话状态的唯一住所。从前 SessionRegistry 是每次调用 new 一个的临时对象
         # （无状态、用完即弃），状态因此无处可放，被 TaskManager / runtime / reducer
         # 各写一份。见 docs/events-v2.md §2.1.1。
@@ -1022,8 +1025,8 @@ class CtxWeftRuntime:
         不再需要 runtime 自己遍历 `_run_tokens` 拍 `cancel()`。
         """
         # 「有没有东西要取消」的判据看三处，不是只看 TaskManager 在不在内存里：
-        # ALM 里还登记着 agent（跑完的会话现在 record 常驻，按需装填也只装
-        # 填 ALM 不建 TM），或者还挂着未决 HITL——这两种情形下 TM 都可能不在内存，而
+        # ALM 里还登记着 agent（跑完的会话 record 常驻，旧入口也可能只装填 ALM），
+        # 或者还挂着未决 HITL——这两种情形下 TM 都可能不在内存，而
         # 该做的事（把 agent 转 `terminated`、把提问收口）一件都没少。
         #
         # 只看 TM 的旧判据会让这些会话**静默早退**：`/cancel` 什么都没做就返回 False，
@@ -1583,6 +1586,7 @@ class CtxWeftRuntime:
             # compare-and-pop：只摘自己登记的那个（见上面 _bind_task_manager 处的注释）。
             if self._task_managers.get(sid) is task_manager:
                 self._task_managers.pop(sid, None)
+                self._prepared_recoveries.pop(sid, None)
         return handle, state
 
     # ── Phase 4 full session ─────────────────────────────────────────────────
@@ -1810,6 +1814,7 @@ class CtxWeftRuntime:
         self,
         session: "Session",
         task_manager: "TaskManager",
+        *, start_tasks: bool = True,
     ) -> None:
         """Wire up ControlCapabilityProvider, set done callback, launch drain.
 
@@ -1882,7 +1887,8 @@ class CtxWeftRuntime:
             on_task_terminal=lambda tid, sid=session.id: self._on_task_terminal(sid, tid),
         ))
 
-        asyncio.create_task(task_manager.drain())
+        if start_tasks:
+            asyncio.create_task(task_manager.drain())
 
     async def _on_task_terminal(self, session_id: str, task_id: str) -> None:
         """`on_task_terminal` 钩子：task 落终态时回收挂在它身上的东西。
@@ -2155,6 +2161,7 @@ class CtxWeftRuntime:
             tm.drop_round_buffer(_tid)
         self._release_round(session_id)
         self._task_managers.pop(session_id, None)
+        self._prepared_recoveries.pop(session_id, None)
         self._agent_lifecycle_manager.forget_session(session_id)
         self._session_registry.forget_session(session_id)
         for _p in self.providers.get_capability_providers():
@@ -2162,46 +2169,132 @@ class CtxWeftRuntime:
                 _p.deregister_session(session_id)
 
     async def rebuild_session(
-        self, session_id: str, *, tenant_id: str | None = None,
+        self, session_id: str, *, tenant_id: str | None = None, strict: bool = False,
     ) -> int:
-        """把这条 session 的内存状态**装填**回来：agent record + 未决 HITL + 成员登记。
-        返回装填的 agent 条数。
+        """Load agents, HITL and the session's sole TaskManager, without execution.
 
-        **只装填，不跑**——与 `rebuild_hitl` 同族（`rebuild_*` = 喂内存，
-        `recover_*` = 喂内存 + 建 TM + drain）。`forget_session`
-        的逆操作：host 的缓存回填走这条，把一条冷会话拉回内存**不会**把它的任务跑起来。
-        要续跑用 `recover_agent`。
+        A cold running agent becomes interrupted; waiting_human stays parked.
+        Tasks retain their persisted status and are not queued. No drain, recap
+        or model call starts here. A live owner is reused without replaying over
+        its uncommitted state. Return the number of loaded agents (0 if absent).
 
-        **这是唯一的按需装填入口。** 从前另有一个 `recover()`：进程启动时扫「全部 active
-        session」各装填一遍。它于 2026-09-09 删除——两个理由。其一，它的循环体逐字就是本
-        方法，同一件事写两处。其二更要命：那个「active」判据是 core 从事件流反推的，而它
-        只会 add、不会 discard（两条 discard 依据 `SessionFinished` / `SessionStatusChanged`
-        早已随会话状态机退役而停发），于是「active 集」= 这台机器历史上跑过的**全部**会话，
-        启动开销与历史会话数线性增长且永不收敛。恢复因此整体改成用户驱动：用到哪条装哪条。
-
-        判据连同 `EventStore.list_active_session_ids` 已于 2026-09-21 整个删除——**「有哪些
-        会话」是 host 自己的数据**，不该由 core 从事件流重新推一遍。host 拿自己的清单（它的
-        会话表 + 状态列，一条带索引的查询）逐条调本方法即可。
-
-        **绝不抛**：`_load_agents_of` 自己就是绝不抛的，`rebuild_hitl` 的失败也只记日志。
-        装不出来（session 在事件日志里压根不存在）返回 0，由调用方决定这算不算错。
-
-        ``tenant_id``：**host 给什么就是什么**（不给 → ``"default"``）。tenant 是 host 侧的
-        概念（宿主那边是 ``"{surrogate_id}:{cowork_id}"``，由 API 层拼出来、写进它自己的
-        session 记录），core 只负责搬运——不推断、不反查、不「猜它是不是忘了传」。
+        strict=True propagates preparation failures to execution callers. The
+        default retains best-effort HITL/calibration behavior, but never publishes
+        a TaskManager after an incomplete load. Host-supplied tenant_id wins.
         """
+        lock = self._resume_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            return await self._rebuild_session_locked(
+                session_id, tenant_id=tenant_id, strict=strict)
+
+    async def _rebuild_session_locked(
+        self, session_id: str, *, tenant_id: str | None = None, strict: bool = False,
+    ) -> int:
+        existing = self._task_managers.get(session_id)
+        if existing is not None and existing.is_alive():
+            return len(self._agent_lifecycle_manager.agent_ids_of_session(session_id))
+
+        from ctx_weft.core.control.reducers import rebuild_view
+
+        # One local view feeds all three registries; never cache a recovery view.
+        view = await rebuild_view(self.event_store, session_id)
+        hitl_loaded = True
         try:
-            await self.rebuild_hitl(session_id)
+            await self._load_hitl_view(session_id, view)
         except Exception:
+            if strict:
+                raise
+            hitl_loaded = False
             logger.exception("rebuild_session: rebuild_hitl failed for %s", session_id)
-        # host 没给 tenant 时由 `_load_agents_of` 从它折出的投影里照搬，并把用掉的那个
-        # 值交回来——`register_session` 用同一个，两处不会记成不同的 tenant。
-        n, tenant_id = await self._load_agents_of(session_id, tenant_id=tenant_id)
+        n, tenant_id = await self._load_agents_view(session_id, view, tenant_id=tenant_id)
         self._session_registry.register_session(session_id, tenant_id=tenant_id)
-        await self._settle_crashed_agents(session_id)
+        try:
+            await self._settle_crashed_agents(session_id, strict=True)
+        except Exception:
+            if strict:
+                raise
+            logger.exception("rebuild_session: calibration failed for %s", session_id)
+            return n
+        if hitl_loaded and session_id in view.sessions:
+            await self._load_task_manager_view(session_id, view, tenant_id=tenant_id)
         return n
 
-    async def _settle_crashed_agents(self, session_id: str) -> int:
+    async def _load_task_manager_view(self, session_id: str, view, *, tenant_id: str) -> None:
+        """Construct and publish a fully loaded owner, with no execution queue."""
+        from ctx_weft.core.control.converters import (
+            session_from_projection, task_from_projection,
+        )
+
+        sess_proj = view.sessions[session_id]
+        session = session_from_projection(sess_proj)
+        session.tenant_id = tenant_id
+        all_tasks = [task_from_projection(tp) for tp in view.tasks.values()]
+        await self._restore_task_prompts(all_tasks, session_id, session.tenant_id)
+        resumable = [t for t in all_tasks if t.status not in TERMINAL_TASK_STATUSES]
+        await self._verify_task_prompts_in_memory(resumable, session_id, session.tenant_id)
+        lm = self._agent_lifecycle_manager
+        lm.register_session(session.id, tenant_id=session.tenant_id)
+        task_manager = TaskManager(
+            session_id=session.id,
+            event_bus=self._event_bus,
+            max_concurrent=self._config.task_max_concurrent,
+            task_max_retries=self._config.task_max_retries,
+            autonomous_requeue_max=self._config.autonomous_requeue_max,
+            autonomous_requeue_backoff_base_sec=(
+                self._config.autonomous_requeue_backoff_base_sec),
+        )
+        task_manager.set_session(session)
+        terminal_ids = {t.id for t in all_tasks if t.status in TERMINAL_TASK_STATUSES}
+        task_manager.restore(all_tasks, terminal_ids, enqueue=False)
+        task_manager.set_unhealthy_check(lambda sid: self.storage_health(sid) is not None)
+        task_manager.set_runner(self._make_task_runner(
+            session=session, lm=lm, memory=self.providers.get_memory(),
+            task_manager=task_manager,
+        ))
+        await self._restore_appended_messages(session)
+        # Publish last: a failed load must not leave an apparently ready owner.
+        try:
+            self._register_and_drain(session, task_manager, start_tasks=False)
+        except Exception:
+            if self._task_managers.get(session_id) is task_manager:
+                self._task_managers.pop(session_id, None)
+            raise
+        # Retain only deferred recovery work, not the replayed session view.
+        self._prepared_recoveries[session_id] = (
+            task_manager, view.tasks_total, dict(view.pending_recap))
+
+    async def _activate_prepared_tasks_locked(
+        self, tm: "TaskManager", *, skip_hitl_id: str = "",
+    ) -> None:
+        """Finish cold recovery after input delivery, before the first drain.
+
+        Caller holds the session's resume lock. Hot owners have no deferred work.
+        Recaps can call a model, so they belong here, never in rebuild_session.
+        """
+        session = tm.session
+        if session is None:
+            raise RuntimeError("TaskManager has no session")
+        prepared = self._prepared_recoveries.get(session.id)
+        if prepared is None or prepared[0] is not tm:
+            return
+        await self._inject_resolved_user_turns(session, tm, skip_hitl_id=skip_hitl_id)
+        parked = {
+            r.task_id for r in self.hitl_registry.list_pending(session_id=session.id)
+            if r.task_id
+        }
+        tm.requeue_resumable(parked)
+        await tm.dispose_blocked_dependents()
+        for tid, info in prepared[2].items():
+            task = tm.get_task(tid)
+            if task is not None:
+                await self._relaunch_task_recap(
+                    session=session, task_manager=tm, task=task,
+                    agent_id=info.get("agent_id") or task.assigned_agent_id or "",
+                    boundary=info.get("boundary") or "finish",
+                )
+        self._prepared_recoveries.pop(session.id, None)
+
+    async def _settle_crashed_agents(self, session_id: str, *, strict: bool = False) -> int:
         """装填之后：把「折出来是 running、而此刻没有任何 run 在跑它」的 agent 判成
         `interrupted`。返回真的发生了转移的条数。
 
@@ -2220,10 +2313,7 @@ class CtxWeftRuntime:
         撒谎。这里恰恰相反——能走到 `rebuild_session` 就说明该 session 的记录是刚从事件
         日志装填回来的，这个进程里没有任何 run 属于它，`running` 是上一次进程留下的残影。
 
-        **只在 `rebuild_session` 这条路上做，不在 `_recover_session_locked` 里做**：后者
-        装填完立刻 `restore` + `drain`，agent 马上就会拿到真的 `AGENT_RUNNING`；在那之前
-        插一条 `AgentInterrupted` 只会让宿主的界面闪一下中断态。分工因此是——
-        `rebuild_session` 装填 + 裁定（不跑），`recover_agent` 装填 + 跑（不裁定）。
+        冷恢复与显式装填共用 rebuild_session；热 owner 不重放、不校准。
 
         幂等：转移发出的 `AgentInterrupted` 会落库，下次装填折出来就是 `interrupted`，
         `next_agent_transition` 对同态输入返回 `None`，不重复发。
@@ -2239,6 +2329,8 @@ class CtxWeftRuntime:
                                          task_id=rec.current_task_id):
                     settled += 1
             except Exception:
+                if strict:
+                    raise
                 # 单个 agent 判不了不该拖垮整条装填——最坏是它继续显示成在跑，
                 # 下一次装填还有机会。
                 logger.exception("_settle_crashed_agents: %s 判定中断失败", aid)
@@ -2413,18 +2505,9 @@ class CtxWeftRuntime:
     ) -> None:
         """续跑一个 agent：复用活 owner TM，或据事件重建后 drain。
 
-        ``keep_alive``：仅供 `_start_task_for_agent` 使用（终审 CRITICAL 1）。该调用方
-        马上要把一个**新** task 塞进刚建好的 TM——普通续跑在"这个 session 已无可恢复
-        task"时的两个结论（既empty history 报 `RuntimeError`，又 all-terminal 报
-        `finalize_idle_session`）在这里都是错的：前者会让"从没跑过、刚被 send_message
-        选中"的合法起点被错判成损坏投影；后者会在 TM 刚建好、`_start_task_for_agent`
-        还没来得及 push 之前就发一条 `SessionFinished` 并把 session 写成终态——给一个
-        正要开始的新一轮先宣告结束。见 `_recover_session_locked` 里两处按 `keep_alive`
-        短路的分支与各自的注释。
-
-        （2026-09-08 之前后果更重：那时 `_fire_session_done` -> `_release_session` 还会
-        把刚建好的 TM 连同该 session 全部 ALM record 一并拆掉，等于原地白建。现在
-        `on_session_done` 只剩 `_release_round`，但「替新一轮宣告结束」这条理由没变。）
+        ``keep_alive``：仅完成冷准备，复用 `rebuild_session` 的统一装填路径。
+        不入队、不 drain、不补注入答复、不启动 recap，也不对空历史或全终态历史
+        做续跑收尾。新建任务的调用方可以先取得 owner，再交付输入和激活任务。
 
         **主键是 agent**（2026-09-04 spec §6.2）；``session_id`` 由 ALM 记录反查。
         session 仍是串行化与资源回收的单位——per-session 锁、owner TM 复用这些
@@ -2443,9 +2526,6 @@ class CtxWeftRuntime:
 
         ``hitl_id``：冷 HITL 应答触发的续跑才有意义——``_resume_after_hitl`` 总是传
         ``req.id``。纯 ``/resume``（无 hitl 语境）留空。
-
-        **未登记的 ``agent_id`` 先自愈、仍缺才抛**：冷启动重启后 ALM registry 可能
-        是空的（这条会话还没被 `rebuild_session` 装填过）。
 
         **装填是调用方的责任，本方法不自愈**（2026-09-21）。从前这里对 miss 会先调
         `rebuild_agent(agent_id)` 扫全部 active session 把记录喂进来——那条 sweep 已删
@@ -2479,6 +2559,13 @@ class CtxWeftRuntime:
                 keep_alive=keep_alive,
             )
 
+    async def prepare_agent(self, agent_id: str) -> None:
+        """Compatibility wrapper; rebuild_session owns all cold preparation."""
+        rec = self._agent_lifecycle_manager.record_of(agent_id)
+        if rec is None:
+            raise AgentNotLoaded(f"agent {agent_id!r} is not loaded")
+        await self.rebuild_session(rec.session_id, tenant_id=rec.tenant_id, strict=True)
+
     async def _recover_session_locked(
         self,
         session_id: str,
@@ -2488,194 +2575,27 @@ class CtxWeftRuntime:
         hitl_id: str = "",
         keep_alive: bool = False,
     ) -> None:
-        """Reuse the live owner TM, or rebuild it from the event store, then resume.
-
-        Called by the host on /resume (INTERRUPTED session) and internally on a cold
-        HITL reply. Internally replays events (or loads snapshot + delta) to reconstruct
-        Session/Task state. Raises RuntimeError with a descriptive message on failure.
-
-        ``keep_alive``: see `recover_agent`'s docstring — threaded through unchanged so
-        the two decision points below (empty-history guard, finalize-when-idle) can be
-        short-circuited for `_start_task_for_agent`'s "bring the TM up, I'm about to push
-        a new task onto it" call, without duplicating the rebuild machinery above them.
-
-        ``user_reply``: when a cold reply resolves an act plain-text pause (``wait_for_user``)
-        HITL, reconcile cannot cover it (no dangling tool_call in the task layer), so the
-        user's reply is injected here as a ``USER_PROMPT`` before drain — then the task
-        re-enters act with the reply in the conversation.
-        """
-        # ── 复用活 owner（单例：有活 TM 就绝不重建）──────────────────────────────
-        # session 的 TaskManager 是单例（`_bind_task_manager`）。内存里已有活 owner 时，
-        # 一切续跑都在它身上就地进行；只有内存里没有 TM（进程重启 / 从未建过 / 已被
-        # forget·purge 逐出）才往下走事件日志重建。
-        #
-        # 从前这里只在「冷 HITL 应答且 owner 持有该 task」与 `keep_alive` 两种情形下复用，
-        # 其余（`/resume`、owner 不含被应答的 task）照样重建一个新 TM 顶替活 owner——旧
-        # TM 已派发的 run 继续跑，新 TM 只避开那几个 task id，却看不见旧 TM 占着哪些
-        # agent，同一个 agent 上于是能并发出两个 run。
-        existing = self._task_managers.get(session_id)
-        if existing is not None and existing.is_alive():
-            # `keep_alive` 的调用方（`_start_task_for_agent`）要的只是「一个能塞新 task
-            # 的活 TM」——已经有了，这里什么都不用做，它马上自己 push。
-            if keep_alive:
-                return
-            await self._recover_in_existing_tm(
-                existing, user_reply=user_reply,
-                resumed_task_id=resumed_task_id, hitl_id=hitl_id,
-            )
-            return
-
-        from ctx_weft.core.control.reducers import rebuild_view
-        view = await rebuild_view(self.event_store, session_id)
-        sess_proj = view.sessions.get(session_id)
-        if sess_proj is None:
+        """Load through rebuild_session, then deliver input and resume one owner."""
+        tm = self._task_managers.get(session_id)
+        if tm is None or not tm.is_alive():
+            await self._rebuild_session_locked(session_id, strict=True)
+            tm = self._task_managers.get(session_id)
+        if tm is None:
             raise RuntimeError(f"Session {session_id!r} not found in event store")
-
-        # 从前这里先取 `sess_proj.template_id`，空则抛「cannot recover」——那道门只服务
-        # 于「按会话模板建 runner」这一件事，而 runner 不再持有模板（每个 agent 装配时
-        # 按自己的 record 现解，见 `_SessionTaskRunner._template_of`），门也就没了依据。
-        # 会话的那份 template_id 仍在投影里，但只是 host 的展示/策略字段。
-        from ctx_weft.core.control.converters import (
-            session_from_projection,
-            task_from_projection,
-        )
-        session = session_from_projection(sess_proj)
-        # 模型选择不再由续跑覆盖——registry 是唯一住所（`AgentLifecycleManager.load()` 下面
-        # 从 `view.agents` 读回，见批次 B）。`session.llm_provider`/`llm_model` 就是
-        # SessionCreated 记录的原始值，纯展示用途，派发从不读它们。
-        all_tasks = [task_from_projection(tp) for tp in view.tasks.values()]
-        # 重放出来的 prompt 带的是 **event ref**（事件 payload 的口径），而它下游要被
-        # driver ingest 进 memory。两个 ref 命名空间互不相通，故必须在此过桥：
-        # event_blob 取字节 → memory 侧重新归一化。每一步只碰一个 store。
-        await self._restore_task_prompts(all_tasks, session_id, sess_proj.tenant_id)
-        # 「开始过的 task 提问一定在 memory 里」只是 `task_from_projection` 的推断，恢复前对着
-        # memory 核一遍；缺了就让 driver 按刚还原出来的 prompt 补写。
-        #
-        # **只核要重排的那些**：这一步每个 task 付一次 `load_view`，而它修正的是「driver
-        # 要不要再写一次这条提问」——终态 task 不会再跑，核它纯属白付。上面的
-        # `_restore_task_prompts` 反过来仍吃全量：它对纯文本是零 IO 的，而终态子任务的
-        # prompt 仍可能被 `_task_label` 在 title 为空时读作描述性名字。
-        resumable = [t for t in all_tasks if t.status not in TERMINAL_TASK_STATUSES]
-        await self._verify_task_prompts_in_memory(resumable, session_id, sess_proj.tenant_id)
-
-        # 装填 HitlRegistry：**park / 重排的判据从此只读内存**（spec §3.1）。必须在算下面
-        # 两个集合之前——registry 空着算出来的 parked 是空集，等于「人还没答，任务却自己
-        # 跑起来了」。装填幂等：活 pending 不会被日志里的旧决定盖掉。
-        await self.rebuild_hitl(session_id)
-        # 有未决 pending HITL 的 task：保持 parked、不重排（人还没答，绝不能自己跑起来）。
-        parked_task_ids = {
-            r.task_id for r in self.hitl_registry.list_pending(session_id=session_id)
-            if r.task_id
-        }
-        # 挂在**已终局** HITL 上的 task **不在这里另开重排口子**：它们已被 restore 的既有
-        # 分支覆盖（ACTIVE → else 分支；SUSPENDED + 子任务全终态 → children 闸门；
-        # SUSPENDED + 尚有活子任务 → 子任务收尾时 `_try_resume_parent` 唤醒，而那些子任务
-        # 本身也被这一趟 restore 重排了）。硬提前重排反而会把那次合法唤醒静默吞掉
-        # （`_try_resume_parent` 以 status == "SUSPENDED" 为门；Task 9 复审 Finding 1）。
-        #
-        # 崩溃窗口真正会丢的是 **UserTurn 那一类**：它的续跑不是「重排」，而是把人的答复
-        # 注入进对话——任务重排了但答复没注入，人说的话就静默消失。见下面
-        # `_inject_resolved_user_turns`。
-
-        terminal_ids = {t.id for t in all_tasks if t.status in TERMINAL_TASK_STATUSES}
-
-        # 被崩溃打断的段 recap（started 无 done）——覆盖全部 observe 段边界。
-        #
-        # **搭 `view` 的车，不另发查询**：这个判断没有时间下界（几个月前那条无 done 的
-        # started 今天仍要重跑），所以它从前是一次「读回该会话全部 recap 事件再折」的查询，
-        # 即便按类型收窄，代价仍随会话长度线性增长（实测 1000 个 task 的会话：取回 1999 条
-        # 折出 1 个，272ms / 5.1MB，每次 `/resume` 付一遍）。进投影之后随快照 + 增量走，
-        # 变成 O(delta)——而 `view` 上面已经建好了。
-        pending_recap = view.pending_recap
-
-        # 既无可恢复 task、且这个会话**从来没有过** task（空/损坏投影）→ 确无事可做，
-        # 保留原抛错。判据是 `view.tasks_total`（创建过几个）而**不是** `all_tasks` 是否为空：
-        # 快照只存活闭包（`prune_view_for_snapshot`）之后，「所有 task 都已终态」同样会让
-        # `all_tasks` 空掉，用集合判就会把一个正常完工的会话误判成坏投影、恢复时直接抛错。
-        # 除非 `keep_alive`：`_start_task_for_agent` 调这里正是为了给一个从没跑过
-        # task 的 agent（冷启动只被 ALM.load() 装填、从未真正执行过）建一个空 TM，
-        # 空历史在这条调用路径上是合法起点，不是损坏投影（终审 CRITICAL 1；
-        # `tests/integration/test_task_recap_recovery.py::test_no_tasks_at_all_still_raises`
-        # 钉死的是 `keep_alive=False` 的默认路径，不受影响）。
-        if not resumable and not view.tasks_total and not keep_alive:
+        if keep_alive:
+            return
+        prepared = self._prepared_recoveries.get(session_id)
+        cold = prepared is not None and prepared[0] is tm
+        resumable = any(t.status not in TERMINAL_TASK_STATUSES for t in tm.all_tasks())
+        if cold and not resumable and not prepared[1]:
             raise RuntimeError(f"Session {session_id!r} has no resumable tasks")
-
-        lm = self._agent_lifecycle_manager
-        # 跨重启后本进程的 registry 可能是空的：下游经 assemble() 触发的
-        # materialize() 一旦撞见未登记的 agent id，需要这份 session 语境才能给它补出
-        # 正确的 session_id/tenant_id（`_register_fallback`）。幂等：已登记则不覆盖
-        # （同 SessionRegistry.register_session 口径）。
-        lm.register_session(session.id, tenant_id=session.tenant_id)
-        task_manager = TaskManager(
-            session_id=session.id,
-            event_bus=self._event_bus,
-            max_concurrent=self._config.task_max_concurrent,
-            task_max_retries=self._config.task_max_retries,
-            autonomous_requeue_max=self._config.autonomous_requeue_max,
-            autonomous_requeue_backoff_base_sec=(
-                self._config.autonomous_requeue_backoff_base_sec),
+        await self._recover_in_existing_tm(
+            tm, user_reply=user_reply, resumed_task_id=resumed_task_id, hitl_id=hitl_id,
         )
-        task_manager.set_session(session)
-        # 走到这里就意味着内存里没有活 owner（有的话上面已经就地复用并 return 了），
-        # 所以不存在「另一个 TM 还在跑着的 task」要避开——从前那道 inflight 过滤正是为
-        # 「新 TM 顶替活 TM」而设，单例之后那种顶替不再发生。
-        task_manager.restore(all_tasks, terminal_ids, parked_task_ids=parked_task_ids)
-
-        # 各 agent 取自己的 template_id（AgentInstantiated 事件投影而来）——喂进 registry，
-        # registry 就是那份缓存。投影里没有的（存量事件流）留空，装配时由 host 声明的
-        # `fallback_template_ref` 兜底，不再借会话的模板。
-        # 与 `rebuild_session` 共用同一条装填路径（`_load_agents_of`），折叠逻辑只此一份
-        # （Task 11）：这里为此重付一次 `rebuild_view` 的代价，换来两处永不漂移。
-        await self._load_agents_of(session.id, tenant_id=session.tenant_id)
-
-        task_manager.set_unhealthy_check(
-            lambda sid: self.storage_health(sid) is not None)  # spec: event-commit
-        task_manager.set_runner(self._make_task_runner(
-            session=session,
-            lm=lm,
-            memory=self.providers.get_memory(),
-            task_manager=task_manager,
-        ))
-        # 崩溃窗口兜底：注入消息已随事件落盘、却没来得及进 memory 的，按事件补回。
-        await self._restore_appended_messages(session)
-        # act 纯文本暂停（wait_for_user）冷应答：把用户回复注入 task 层并重排（reconcile 覆盖不到,见上）。
-        if user_reply is not None:
-            await self._inject_user_reply(user_reply, session, task_manager)
-        # 崩溃窗口兜底：已终局的 UserTurn 请求，其答复若还没进过对话，在这里补上。
-        await self._inject_resolved_user_turns(
-            session, task_manager,
-            skip_hitl_id=getattr(user_reply, "id", "") if user_reply is not None else "",
-        )
-
-        # 重跑被崩溃打断的段 recap（登记到新 TM；close 边界补 register_close_synth 替换占位 finish 对）。
-        tasks_by_id = {t.id: t for t in all_tasks}
-        for tid, info in pending_recap.items():
-            t = tasks_by_id.get(tid)
-            if t is None:
-                continue
-            await self._relaunch_task_recap(
-                session=session,
-                task_manager=task_manager, task=t,
-                agent_id=info.get("agent_id") or t.assigned_agent_id or "",
-                boundary=info.get("boundary") or "finish",
-            )
-
-        # spec: task-handoff——恢复期的永久阻塞扫描（restore 重建依赖后、首次 drain 前）：
-        # 崩溃窗口里 A 的 FAILED 已落盘、B 的级联取消未落盘时，A 的失败回调不会重放，
-        # 靠这一趟幂等补扫把 B 判定并落终态，否则 B 永久 PENDING。
-        await task_manager.dispose_blocked_dependents()
-
-        self._register_and_drain(session, task_manager)
-        # gather 重跑的后台 recap 后发 SESSION_FINISHED（终态镜像 on_task_finished）。
-        # `keep_alive` 短路这一步：`_start_task_for_agent` 调用这里正是为了拿到一个能塞
-        # 新 task 的活 TM，紧接着就要 push——在那之前 finalize 一次（发 SessionFinished、
-        # 把 session 写成终态）等于替一个正要开始的新一轮宣告结束（终审 CRITICAL 1；
-        # 2026-09-08 前后果更重：那时还会连带 `_release_session` 把刚建好的 TM 和全部
-        # agent record 一起拆掉）。resumable 是否为空交给调用方接下来 push 的新 task
-        # 去填，不在这里替它下判决。
-        if not resumable and not keep_alive:
+        if cold and not resumable:
+            session = tm.session
             final_status = "FAILED" if session.failure_counter > 0 else "SUCCEEDED"
-            await task_manager.finalize_idle_session(final_status)
+            await tm.finalize_idle_session(final_status)
 
     async def _verify_task_prompts_in_memory(
         self, tasks: "list[Task]", session_id: str, tenant_id: str,
@@ -2899,9 +2819,7 @@ class CtxWeftRuntime:
           重放），再补一次 drain。正在跑的、已在队列里的、还挂着未决 HITL 的都不动，
           所以对同一个 session 连按几次 ``/resume`` 是幂等的。
 
-        重建路径上那几件崩溃善后（补注入已终局的 UserTurn、重跑被打断的段 recap、
-        「全终态却没收尾」时补发 SessionFinished）这里都不做：owner 活着就说明进程没崩，
-        那些 recap 此刻还在它自己的后台跑着，重跑只会出第二份。
+        冷装填 owner 的补写、依赖清理和 recap 在输入交付后、首次 drain 前完成。
         """
         if resumed_task_id is not None:
             if tm.get_task(resumed_task_id) is None:
@@ -2929,6 +2847,8 @@ class CtxWeftRuntime:
         if requeued:
             logger.info("Recovery: session %s resumed in place on its live TaskManager: %s",
                         session.id, requeued)
+        await self._activate_prepared_tasks_locked(
+            tm, skip_hitl_id=getattr(user_reply, "id", "") if user_reply is not None else "")
         self._register_and_drain(session, tm)
 
     async def _resume_in_existing_tm(
@@ -2962,6 +2882,7 @@ class CtxWeftRuntime:
         # 被跳过，它的那条已终局答复只能等下一次续跑来补——就是这里（审查文档 M8）。
         await self._inject_resolved_user_turns(session, tm, skip_hitl_id=hitl_id)
         await tm.resume_task(resumed_task_id, hitl_id=hitl_id)
+        await self._activate_prepared_tasks_locked(tm, skip_hitl_id=hitl_id)
         self._register_and_drain(session, tm)
 
     async def compact_agent(
@@ -3317,6 +3238,10 @@ class CtxWeftRuntime:
         # 守卫在装填**之后**：装填前 registry 的 miss 只说明「还没喂进来」，不说明
         # 这个 agent 不能收消息。放在前面会让上面那次自愈永远执行不到（`status_of`
         # 对未登记的 id 抛 `AgentNotFound`，而它正是本方法要修的那个误判）。
+        tm = self._task_managers.get(rec.session_id)
+        if tm is None or not tm.is_alive():
+            await self.rebuild_session(rec.session_id, tenant_id=rec.tenant_id, strict=True)
+            rec = reg.record_of(agent_id)
         reg.assert_can_receive(agent_id)
 
         current = rec.current_task_id
@@ -3326,6 +3251,14 @@ class CtxWeftRuntime:
         else:
             task_id = await self._start_task_for_agent(
                 agent_id, content, unattended=unattended, port_key=port_key)
+
+        # Input is installed before cold tasks or background model work can run.
+        tm = self._task_managers.get(rec.session_id)
+        if tm is not None and tm.is_alive():
+            lock = self._resume_locks.setdefault(rec.session_id, asyncio.Lock())
+            async with lock:
+                await self._activate_prepared_tasks_locked(tm)
+                asyncio.create_task(tm.drain())
 
         return TurnHandle(
             session_id=rec.session_id,
@@ -3367,12 +3300,11 @@ class CtxWeftRuntime:
         事件」的孤儿，重启后 `rebuild_hitl` 会把它当未决恢复出来，还会被 `resume_agent`
         的 `_pause_bubble_of` 误当成暂停气泡放行一次冷续跑。装填要装齐。
 
-        **只装填 ALM + HITL，不建 TaskManager**：TM 那一半由 `_start_task_for_agent`
-        已有的探测接住（`tm is None or not tm.is_alive()` → `recover_agent(keep_alive=True)`），
-        那时 `record_of` 已经命中。两段各管一半，不重复。
+        **统一装填 ALM、HITL 和 TaskManager**：重建保留任务的持久化状态，不入队、
+        不执行。`send_message` 必须先完成准备，再判断旧任务是否终态，最后交付输入
+        并激活任务，不能把缺 owner 当作旧任务已经结束。
 
-        **给了 session_id 就绝不抛**：`rebuild_session` 自己就是绝不抛的。装填不成，
-        调用方那边 `record_of` 仍是 None，照常抛 `AgentNotFound`——那才是真的查无此 agent。
+        严格装填失败直接抛出；不能把准备失败当作 agent 或旧任务不存在。
         """
         if session_id is None:
             # HITL 那半在这条路上本来也装不了（`rebuild_hitl` 按 session 定址），所以
@@ -3381,18 +3313,17 @@ class CtxWeftRuntime:
                 f"agent {agent_id!r} is not loaded and no session_id was given — "
                 f"call rebuild_session(session_id) first, or pass session_id to send_message"
             )
-        await self.rebuild_session(session_id)
+        await self.rebuild_session(session_id, strict=True)
 
     def _task_is_terminal(self, session_id: str, task_id: str) -> bool:
         """`current_task_id` 是否已终态——`send_message` 路由的唯一判据。
 
-        TM 或 task 查无 -> 视为终态：宁可保守地新建一个 task，也不要把外部消息注进
-        一个此刻已经不可寻的旧 task（比如该 session 的 TM 不在内存里——见 `get_agent`
-        同一判据下的降级口径）。
+        必须先装填 TM；缺 owner 是准备失败，不能当作旧任务已结束。
+        已装填 owner 中缺 task 可由终态快照裁剪产生，沿用终态判据。
         """
         tm = self._task_managers.get(session_id)
         if tm is None:
-            return True
+            raise RuntimeError(f"Session {session_id!r} is not prepared for message routing")
         task = tm.get_task(task_id)
         if task is None:
             return True
@@ -3422,7 +3353,7 @@ class CtxWeftRuntime:
           （**不是** `TaskHumanResolved`——那是 `TaskAwaitingHuman{hitl_id}` 的一对一
           配对解除事件，只属于 HITL 应答路径，发生在这里会留一个配不上对的孤儿事件，
           还会经 ALM 把 agent 状态提前翻成 `running`——task 明明还没真正开跑，见
-          `requeue_for_message` 自己的 docstring）。重排成功后补一次 `drain()`——
+          `requeue_for_message` 自己的 docstring）。调用方在输入交付完成后启动 `drain()`——
           `requeue_for_message` 只管入队、不 drain，与 `resume_task` 同一分工。
 
         非 `_suspended_on_live_children` 分支还会在 `requeue_for_message` 之前先
@@ -3514,9 +3445,7 @@ class CtxWeftRuntime:
         target.process_report = None
         target.process_report_at = None
         requeued = await tm.requeue_for_message(task_id)
-        if requeued:
-            asyncio.create_task(tm.drain())
-        else:
+        if not requeued:
             # 重排是 no-op（task 已在队列 / 已在跑 / 已终态）→ **没有为这条消息新开的
             # run**，也就没有提交点会来关窗。窗口留着就是永久缓冲：这条消息以及它收口
             # 掉的气泡再也不会落盘。就地提交，让它与改造前同样立刻算数。
@@ -3543,20 +3472,12 @@ class CtxWeftRuntime:
 
         复用同一个正在跑的 TaskManager（`self._task_managers[session_id]`）：会话
         建立时 `_register_and_drain` 已经给它 `set_runner` / `set_is_current` /
-        挂好 done/idle 回调，这里只管 push 一个新 task 再补一次 drain，不重新接线。
+        挂好 done/idle 回调，这里只 push 新 task；调用方在输入就绪后激活并 drain。
 
-        **"agent 还在 == TM 还在"不成立**（终审 CRITICAL 1，订正此前这条docstring
-        的错误断言）：`rebuild_session` 只装填 `AgentLifecycleManager`（`_load_agents_of`），
-        从不建 TaskManager（`rebuild_*` = 喂内存不跑）——一个刚被装填、还没被任何
-        `/resume` 或冷 HITL 应答碰过的 agent，
-        `record_of` 命中但 `self._task_managers[rec.session_id]` 会是纯粹的
-        `KeyError`。这里因此先探测 TM 是否活着，缺失/已被顶替时调用
-        `recover_agent(agent_id, keep_alive=True)` 走**同一条**事件重建路径（不另写
-        一套）把它建出来——`keep_alive=True` 让 `_recover_session_locked` 跳过它对
-        "空历史"的报错与"无可恢复 task 就 finalize"的收尾（两者都会在这个新 TM
-        刚建好、还没来得及塞进新 task 之前就把它连同 ALM record 一并拆掉，见
-        `recover_agent`/`_recover_session_locked` 的 docstring）。**已经活着的会话
-        不付这次重建**：探测放在最前面，是快路径。
+        正常入口已在判断旧任务前通过 `rebuild_session` 完成统一准备。这里仍保留
+        缺 owner 的防御性兼容路径，处理只装填过 ALM 的旧入口：
+        `recover_agent(agent_id, keep_alive=True)` 只准备 owner，不提前执行或宣告会话结束。
+        已有活 owner 时直接复用，不再次重建。
         """
         reg = self._agent_lifecycle_manager
         rec = reg.record_of(agent_id)
@@ -3636,7 +3557,6 @@ class CtxWeftRuntime:
             task, user_prompt_event_jsonable=event_jsonable, provisional=True,
         )
         reg.set_current_task(agent_id, task.id)
-        asyncio.create_task(tm.drain())
         return task.id
 
     # ── 宿主侧任务派发（spec/09）────────────────────────────────────────────────
@@ -3858,7 +3778,10 @@ class CtxWeftRuntime:
         # ── 10/11/12 ─────────────────────────────────────────────────────────
         # 路由的 current_task 记在**执行者**头上，不是血缘父——派生场景下 A 并不跑它。
         reg.set_current_task(exec_agent_id, task.id)
-        asyncio.create_task(tm.drain())
+        lock = self._resume_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            await self._activate_prepared_tasks_locked(tm)
+            asyncio.create_task(tm.drain())
         return TurnHandle(
             session_id=session_id,
             agent_id=exec_agent_id,
@@ -4534,6 +4457,12 @@ class CtxWeftRuntime:
         from ctx_weft.core.control.reducers import rebuild_view
 
         view = await rebuild_view(self.event_store, session_id)
+        return await self._load_agents_view(session_id, view, tenant_id=tenant_id)
+
+    async def _load_agents_view(
+        self, session_id: str, view, *, tenant_id: str | None = None,
+    ) -> "tuple[int, str]":
+        """Shared loader: preserve identity, live tasks and cold-only broadcasts."""
         sess_proj = view.sessions.get(session_id)
         if tenant_id is None:
             tenant_id = (
@@ -4584,7 +4513,12 @@ class CtxWeftRuntime:
         """
         from ctx_weft.core.control.reducers import rebuild_view
 
-        snapshot = (await rebuild_view(self.event_store, session_id)).hitl
+        view = await rebuild_view(self.event_store, session_id)
+        return await self._load_hitl_view(session_id, view)
+
+    async def _load_hitl_view(self, session_id: str, view) -> int:
+        """Shared loader, including blob hydration and active-pending protection."""
+        snapshot = view.hitl
         await self._hydrate_snapshot_messages(snapshot, session_id)
         return self.hitl_registry.load_snapshot(snapshot)
 
