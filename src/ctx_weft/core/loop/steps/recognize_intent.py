@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from contextlib import aclosing
 from typing import Any
 
 from ctx_weft.core.loop.driver import LoopContext, LoopState, Step, StepOutcome, make_event
@@ -21,6 +22,7 @@ from ctx_weft.core.orchestrator.task.disposition import RunOutcomeKind
 from ctx_weft.protocols.events import EventOrigin, EventType
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols.capability import ToolCapability
+from ctx_weft.providers.llm.stream import ensure_collected_stream
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +152,7 @@ class RecognizeIntentStep(Step):
         )
         prompt = await ctx.assembler.assemble(request)
 
-        from ctx_weft.protocols import LLMRequest, LLMUsage
+        from ctx_weft.protocols import LLMRequest
 
         llm_request = LLMRequest(
             model=resolve_llm_identity(state)[0],
@@ -173,13 +175,6 @@ class RecognizeIntentStep(Step):
 
         from ctx_weft.protocols import ToolCall
 
-        tool_call_obj: ToolCall | None = None
-        tool_name = ""
-        tool_args: dict[str, Any] = {}
-        usage = LLMUsage()
-        text = ""
-        reasoning = ""
-
         # 复审修复第二轮（task-6）：request_prompt_estimate 在 stream_llm_resilient 被
         # 调用**之前**跑——此刻 LLM_REQUEST_STARTED 不可能已经发出（它是 gateway 函数体
         # 内的第一段代码，函数还没被调用）。单独一个 try：失败仍按 pre-task-6 的既有语义
@@ -201,19 +196,13 @@ class RecognizeIntentStep(Step):
         # apply_dynamic_max_tokens 挪到了 LLM_REQUEST_STARTED/LLM_PROMPT_SENT 发射之后
         # （llm_gateway.py，同一轮复审修复）——进了这段代码往下走，就意味着 STARTED
         # 已经发出，下面的 except 分支据此才需要、也才能安全地补发 LLM_RESPONSE_FINISHED。
+        stream = ensure_collected_stream(stream_llm_resilient(ctx, state, llm_request))
         try:
-            async for chunk in stream_llm_resilient(ctx, state, llm_request):
-                if chunk.kind == "token":
-                    text += chunk.text
-                elif chunk.kind == "reasoning":
-                    reasoning += chunk.text
-                elif chunk.kind == "tool_call" and chunk.tool_call:
-                    tool_call_obj = chunk.tool_call
-                    tool_name = chunk.tool_call.name
-                    tool_args = chunk.tool_call.arguments
-                elif chunk.kind == "usage" and chunk.usage is not None:
-                    usage = chunk.usage
+            async with aclosing(stream):
+                async for _ in stream:
+                    stream.accept_current()
         except Exception as exc:
+            partial = stream.partial_result()
             if getattr(exc, "retriable", False):
                 logger.warning("RecognizeIntentStep: LLM call failed for task %s: %s", target_task_id, exc)
             else:
@@ -235,12 +224,18 @@ class RecognizeIntentStep(Step):
             await ctx.event_bus.emit(make_event(
                 state, EventType.LLM_RESPONSE_FINISHED,
                 payload={
-                    "request_id": req_id, "content": text, "reasoning": reasoning,
+                    "request_id": req_id, "content": partial.text, "reasoning": partial.reasoning,
                     "tool_calls": [],
-                    "usage": dataclasses.asdict(usage),
+                    "usage": dataclasses.asdict(partial.usage),
                     "llm_model": model, "llm_account": llm_account,
                     "finish_reason": "error"}))
             return StepOutcome(next_step=None)
+
+        result = stream.get_final_result()
+        text, reasoning, usage = result.text, result.reasoning, result.usage
+        tool_call_obj: ToolCall | None = result.tool_calls[-1] if result.tool_calls else None
+        tool_name = tool_call_obj.name if tool_call_obj is not None else ""
+        tool_args = tool_call_obj.arguments if tool_call_obj is not None else {}
 
         # LLM_RESPONSE_FINISHED：gateway 只发流式侧 4 个事件，收尾事件由各调用方自己发
         # （同 act.py / compact.py 的既定分工）——否则 LLM_REQUEST_STARTED 有始无终，host

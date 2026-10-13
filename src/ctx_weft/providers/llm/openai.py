@@ -21,7 +21,7 @@ from ctx_weft.protocols import (
 from ctx_weft.providers.llm._finalize import build_finalize_chunks, parse_tool_arguments
 from ctx_weft.providers.llm._modality import downgrade_for_text_only
 from ctx_weft.providers.llm._schema import sanitize_boolean_schemas
-from ctx_weft.providers.llm.text_calls import ContentGate, merge_content as _merge_content
+from ctx_weft.providers.llm.stream import CollectedLLMStream
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 
 logger = logging.getLogger(__name__)
@@ -101,21 +101,22 @@ class OpenAIAdapter(LLMClient):
         return True
 
     def complete(self, request: LLMRequest, stream: bool = True) -> AsyncIterator[LLMChunk]:
-        return self._stream(request)
+        return self.open_stream(request, stream)
 
-    async def _stream(self, request: LLMRequest) -> AsyncIterator[LLMChunk]:
+    def open_stream(self, request: LLMRequest, stream: bool = True) -> CollectedLLMStream:
+        return CollectedLLMStream(lambda owner: self._stream(request, owner), raw_text=True)
+
+    async def _stream(self, request: LLMRequest, owner: CollectedLLMStream) -> AsyncIterator[LLMChunk]:
         payload = self._build_payload(request)
         headers = self._headers()
         url = self._chat_url()
 
         produced = False  # 是否已向消费者吐过 chunk（流已开始）
         for attempt in range(self._max_http_retries):
-            tool_call_buffers: dict[int, dict[str, Any]] = {}
+            state = owner.new_attempt()
             last_tc_idx: int | None = None  # 供缺 index 的续传 delta 归到最后活跃桶
-            content_text = ""
             finish_reason: str | None = None
             usage: LLMUsage | None = None
-            gate = ContentGate()  # 增量剥离 <think>/<tool_call> 标签
             try:
                 # 流式 read 超时 = 闲置(自上一字节起)超时,而非整段时长上限:正常流(token/思考/
                 # 工具参数分片)持续来字节会不断重置计时器,故长工具调用/长思考不会误触发。仅当连接
@@ -211,31 +212,25 @@ class OpenAIAdapter(LLMClient):
 
                         text = delta.get("content") or ""
                         if text:
-                            content_text = _merge_content(content_text, text)
-                            tok = gate.feed(content_text)
+                            tok = state.feed_text(text)
                             if tok:
                                 produced = True
                                 yield LLMChunk(kind="token", text=tok)
 
                         tc_deltas = delta.get("tool_calls") or []
                         for tc_delta in tc_deltas:
-                            idx = _resolve_tc_index(tc_delta, tool_call_buffers, last_tc_idx)
+                            idx = _resolve_tc_index(tc_delta, state.tool_buffers, last_tc_idx)
                             last_tc_idx = idx
-                            if idx not in tool_call_buffers:
-                                tool_call_buffers[idx] = {"id": "", "name": "", "arguments": ""}
-                            buf = tool_call_buffers[idx]
-                            if tc_delta.get("id"):
-                                buf["id"] = tc_delta["id"]
                             fn = tc_delta.get("function") or {}
                             name = fn.get("name")
-                            if name:
-                                buf["name"] += name if isinstance(name, str) else str(name)
                             args = fn.get("arguments")
                             if args:
                                 args = args if isinstance(args, str) else json.dumps(args)
-                                # merge_content：兼容增量与「字符级前缀重发」两种流式语义，
-                                # 避免重发被盲拼成畸形（同 content 的 N5 防御）。
-                                buf["arguments"] = _merge_content(buf["arguments"], args)
+                            state.feed_tool(
+                                idx, call_id=tc_delta.get("id") or "",
+                                name=(name if isinstance(name, str) else str(name)) if name else "",
+                                arguments=args or "", append_name=True,
+                            )
                         if tc_deltas:
                             # 工具调用参数流式累积期间不产出 token：消费者的 async-for 会一直挂起，
                             # act 流式循环顶部的暂停/取消检查点无从触发 → 发个无负载心跳让其有机会运行。
@@ -247,13 +242,13 @@ class OpenAIAdapter(LLMClient):
                     # 流以任何方式结束（[DONE] / 自然结束）→ 统一收尾：截断判定、
                     # native 规整、文本/思考还原、usage、done（见 _finalize）。
                     for ch in build_finalize_chunks(
-                        content_text=content_text,
-                        native_tool_calls=_parse_buffers(tool_call_buffers),
-                        had_native_buffer=bool(tool_call_buffers),
+                        content_text=state.content_text,
+                        native_tool_calls=_parse_buffers(state.tool_buffers),
+                        had_native_buffer=bool(state.tool_buffers),
                         saw_terminal=finish_reason is not None,
                         usage=usage,
                         finish_reason=finish_reason,
-                        emitted_visible_len=gate.emitted_len,
+                        emitted_visible_len=state.gate.emitted_len,
                     ):
                         yield ch
                     return
@@ -264,7 +259,7 @@ class OpenAIAdapter(LLMClient):
                 if produced:
                     logger.warning(
                         "OpenAI stream interrupted mid-flight (tool_call_in_progress=%s): %s",
-                        bool(tool_call_buffers), exc,
+                        bool(state.tool_buffers), exc,
                     )
                     raise LLMCallError(
                         f"LLM stream interrupted mid-flight: {exc}", retriable=True, outage=True,

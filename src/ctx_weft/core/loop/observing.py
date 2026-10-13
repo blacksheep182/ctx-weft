@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any
 
-from ctx_weft.protocols import LLMMessage, LLMRequest, LLMUsage
+from ctx_weft.protocols import LLMMessage, LLMRequest
+from ctx_weft.providers.llm.stream import ensure_collected_stream
 from ctx_weft.protocols.events import EventType
 from ctx_weft.core.loop.driver import make_event
 from ctx_weft.core.loop.llm_gateway import (
@@ -111,20 +113,13 @@ async def run_observe_react(
         # 不用 round）；round_num 仍是本函数内部的轮次计数局部变量，只是不再直接进 payload。
         llm_request.metadata["turn"] = round_num
 
-        accumulated_text = ""
-        reasoning_text = ""
-        tool_calls = []
-        usage = LLMUsage()
-
-        async for chunk in stream_llm_resilient(ctx, state, llm_request):
-            if chunk.kind == "token":
-                accumulated_text += chunk.text
-            elif chunk.kind == "reasoning":
-                reasoning_text += chunk.text
-            elif chunk.kind == "tool_call" and chunk.tool_call is not None:
-                tool_calls.append(chunk.tool_call)
-            elif chunk.kind == "usage" and chunk.usage is not None:
-                usage = chunk.usage
+        stream = ensure_collected_stream(stream_llm_resilient(ctx, state, llm_request))
+        async with aclosing(stream):
+            async for _ in stream:
+                stream.accept_current()
+        result = stream.get_final_result()
+        accumulated_text, reasoning_text = result.text, result.reasoning
+        tool_calls, usage = list(result.tool_calls), result.usage
 
         if accumulated_text:
             last_text = accumulated_text
@@ -172,6 +167,7 @@ async def run_observe_react(
                 break
             current_messages.append(LLMMessage(
                 role="assistant", content=accumulated_text or "(no reply)",
+                provider_state=result.provider_state,
             ))
             current_messages.append(LLMMessage(
                 role="user",
@@ -185,6 +181,7 @@ async def run_observe_react(
             role="assistant",
             content=accumulated_text,
             tool_calls=[{"id": tc.id, "name": tc.name, "input": tc.arguments} for tc in tool_calls],
+            provider_state=result.provider_state,
         ))
 
         terminal_result = None

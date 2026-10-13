@@ -109,6 +109,10 @@ class _FixedModelClient:
             dataclasses.replace(request, model=self._model), stream
         )
 
+    def open_stream(self, request: LLMRequest, stream: bool = True):
+        from ctx_weft.providers.llm.stream import ensure_collected_stream
+        return ensure_collected_stream(self.complete(request, stream))
+
     @property
     def tokenizer(self):
         return self._adapter.tokenizer_for(self._model)

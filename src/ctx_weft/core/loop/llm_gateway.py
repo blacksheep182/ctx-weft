@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import json
 import logging
 import random
 from collections.abc import AsyncIterator
@@ -53,6 +52,7 @@ from ctx_weft.core.utils.content import rehydrate_content, redact_content_for_ev
 from ctx_weft.protocols.events import EventType
 from ctx_weft.core.loop.driver import make_event
 from ctx_weft.core.utils.estimate import dynamic_max_tokens, estimate_content_tokens, estimate_tool_calls_tokens
+from ctx_weft.providers.llm.stream import DelegatingLLMStream
 if TYPE_CHECKING:
     from ctx_weft.protocols import ContentPart, LLMChunk, LLMClient, LLMRequest
 
@@ -110,6 +110,7 @@ def drop_dangling_tool_calls(messages: list[LLMMessage]) -> list[LLMMessage]:
                 m = LLMMessage(
                     role=m.role, content=m.content, tool_calls=kept,
                     tool_call_id=m.tool_call_id, reasoning_content=m.reasoning_content,
+                    provider_state=m.provider_state,
                 )
         out.append(m)
     return out
@@ -262,9 +263,23 @@ def merge_consecutive_messages(messages: list[LLMMessage]) -> list[LLMMessage]:
                 role=prev.role,
                 content=_merge_message_content(prev.content, msg.content),
                 tool_calls=prev.tool_calls + msg.tool_calls,
+                provider_state=_merge_provider_state(prev.provider_state, msg.provider_state),
             )
         else:
             merged.append(msg)
+    return merged
+
+
+def _merge_provider_state(left: dict, right: dict) -> dict:
+    """Keep continuation metadata attached when legalizing consecutive assistants."""
+    if not left or not right:
+        return left or right
+    merged = left | right
+    if "anthropic" in left and "anthropic" in right:
+        a, b = left["anthropic"], right["anthropic"]
+        merged["anthropic"] = a | b
+        for key in ("thinking_blocks", "tool_call_ids"):
+            merged["anthropic"][key] = [*a.get(key, ()), *b.get(key, ())]
     return merged
 
 
@@ -431,7 +446,16 @@ def apply_dynamic_max_tokens(ctx, request: "LLMRequest", loop_guard) -> None:
     )
 
 
-async def stream_llm(
+def stream_llm(
+    llm: "LLMClient", request: "LLMRequest", *, stream: bool = True,
+    blob_store: "Any" = None, provider_ctx: "Any" = None,
+) -> DelegatingLLMStream:
+    return DelegatingLLMStream(lambda owner: _stream_llm(
+        owner, llm, request, stream=stream, blob_store=blob_store, provider_ctx=provider_ctx))
+
+
+async def _stream_llm(
+    owner: DelegatingLLMStream,
     llm: "LLMClient", request: "LLMRequest", *, stream: bool = True,
     blob_store: "Any" = None, provider_ctx: "Any" = None,
 ) -> AsyncIterator["LLMChunk"]:
@@ -465,8 +489,12 @@ async def stream_llm(
                 m.content, blob_store=blob_store, ctx=provider_ctx))
             for m in request.messages
         ]
-    async for chunk in llm.complete(request, stream=stream):
-        yield chunk
+    source = owner.bind(llm.complete(request, stream=stream))
+    try:
+        async for chunk in source:
+            yield chunk
+    finally:
+        await source.aclose()
 
 
 # ── 自愈退避包装 ───────────────────────────────────────────────────────────────
@@ -534,7 +562,12 @@ async def _emit_retry(
     }))
 
 
-async def stream_llm_resilient(ctx, state, request) -> AsyncIterator["LLMChunk"]:
+def stream_llm_resilient(ctx, state, request) -> DelegatingLLMStream:
+    """Expose the current attempt's shared result without another collector."""
+    return DelegatingLLMStream(lambda owner: _stream_llm_resilient(owner, ctx, state, request))
+
+
+async def _stream_llm_resilient(owner, ctx, state, request) -> AsyncIterator["LLMChunk"]:
     """退避自愈包装：把 retriable+outage 的 LLM 调用在进程内指数退避重试。
 
     - 仅当本次尝试**尚未 yield 任何 chunk** 时重试（避免重复 token / 污染累积）。
@@ -608,23 +641,27 @@ async def stream_llm_resilient(ctx, state, request) -> AsyncIterator["LLMChunk"]
     attempt = 0
     while True:
         yielded_anything = False
+        source = owner.bind(stream_llm(
+            ctx.llm, request,
+            blob_store=getattr(ctx, "blob_store", None),
+            provider_ctx=getattr(ctx, "provider_ctx", None),
+        ))
         try:
-            async for chunk in stream_llm(
-                ctx.llm, request,
-                blob_store=getattr(ctx, "blob_store", None),
-                provider_ctx=getattr(ctx, "provider_ctx", None),
-            ):
-                if emit_stream_events:
-                    if chunk.kind == "token":
-                        await bus.emit(make_event(
-                            state, EventType.LLM_TOKEN_STREAMED,
-                            payload={"request_id": request_id, "delta": chunk.text}))
-                    elif chunk.kind == "reasoning":
-                        await bus.emit(make_event(
-                            state, EventType.LLM_REASONING_STREAMED,
-                            payload={"request_id": request_id, "delta": chunk.text}))
-                yielded_anything = True
-                yield chunk
+            try:
+                async for chunk in source:
+                    if emit_stream_events:
+                        if chunk.kind == "token":
+                            await bus.emit(make_event(
+                                state, EventType.LLM_TOKEN_STREAMED,
+                                payload={"request_id": request_id, "delta": chunk.text}))
+                        elif chunk.kind == "reasoning":
+                            await bus.emit(make_event(
+                                state, EventType.LLM_REASONING_STREAMED,
+                                payload={"request_id": request_id, "delta": chunk.text}))
+                    yielded_anything = True
+                    yield chunk
+            finally:
+                await source.aclose()
             return  # success
         except LLMCallError as e:
             if not getattr(e, "retriable", True) or not _is_outage(e):

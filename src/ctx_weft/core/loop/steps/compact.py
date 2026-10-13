@@ -21,10 +21,12 @@ import inspect
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from contextlib import aclosing
 from datetime import timedelta
 from typing import Any
 
 from ctx_weft.core.assembler.assembler import ContextRequest
+from ctx_weft.providers.llm.stream import ensure_collected_stream
 from ctx_weft.protocols.events import EventOrigin, EventType
 from ctx_weft.core.loop.driver import LoopContext, LoopState, Step, StepOutcome, make_event
 from ctx_weft.core.loop.llm_gateway import (
@@ -38,7 +40,7 @@ from ctx_weft.core.utils.content import content_to_text, image_tokens
 from ctx_weft.core.utils.estimate import effective_limit
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.protocols import (
-    LLMRequest, LLMUsage, MemoryAddress, MemoryEvent, MemoryEventType, MemoryKind, MemoryScope,
+    LLMRequest, MemoryAddress, MemoryEvent, MemoryKind, MemoryScope,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,16 +212,12 @@ async def summarize_for_compact(
     should_emit_finished = bus is not None and getattr(state, "origin", None) == EventOrigin.LOOP_COMPACT
     req_id = f"req_{agent.id}_{state.sequence_counter}" if should_emit_finished else None
 
-    summary_text = ""
-    reasoning_text = ""
-    usage = LLMUsage()
-    async for chunk in stream_llm_resilient(ctx, state, llm_request):
-        if chunk.kind == "token":
-            summary_text += chunk.text
-        elif chunk.kind == "reasoning":
-            reasoning_text += chunk.text
-        elif chunk.kind == "usage" and chunk.usage is not None:
-            usage = chunk.usage
+    stream = ensure_collected_stream(stream_llm_resilient(ctx, state, llm_request))
+    async with aclosing(stream):
+        async for _ in stream:
+            stream.accept_current()
+    result = stream.get_final_result()
+    summary_text, reasoning_text, usage = result.text, result.reasoning, result.usage
 
     if should_emit_finished:
         await bus.emit(make_event(

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from ctx_weft.core.utils.content import content_to_text
 from ctx_weft.protocols import LLMChunk, LLMClient, LLMRequest, LLMUsage, ToolCall
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
+from ctx_weft.providers.llm.stream import CollectedLLMStream
 
 
 @dataclass
@@ -139,7 +140,13 @@ class MockLLMAdapter(LLMClient):
     def supports_tool_calling(self) -> bool:
         return True
 
-    def complete(
+    def complete(self, request: LLMRequest, stream: bool = True) -> CollectedLLMStream:
+        return self.open_stream(request, stream)
+
+    def open_stream(self, request: LLMRequest, stream: bool = True) -> CollectedLLMStream:
+        return CollectedLLMStream(self._complete(request, stream))
+
+    def _complete(
         self,
         request: LLMRequest,
         stream: bool = True,

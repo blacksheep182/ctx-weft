@@ -20,9 +20,8 @@ from ctx_weft.protocols import (
 from ctx_weft.providers.llm._finalize import build_finalize_chunks, parse_tool_arguments
 from ctx_weft.providers.llm._modality import downgrade_for_text_only
 from ctx_weft.providers.llm._schema import sanitize_boolean_schemas
-from ctx_weft.providers.llm.text_calls import (
-    ContentGate, merge_content as _merge_content, unwrap_raw_arguments,
-)
+from ctx_weft.providers.llm.stream import CollectedLLMStream
+from ctx_weft.providers.llm.text_calls import unwrap_raw_arguments
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 
 logger = logging.getLogger(__name__)
@@ -96,24 +95,24 @@ class AnthropicAdapter(LLMClient):
         return True
 
     def complete(self, request: LLMRequest, stream: bool = True) -> AsyncIterator[LLMChunk]:
-        return self._stream(request)
+        return self.open_stream(request, stream)
 
-    async def _stream(self, request: LLMRequest) -> AsyncIterator[LLMChunk]:
+    def open_stream(self, request: LLMRequest, stream: bool = True) -> CollectedLLMStream:
+        return CollectedLLMStream(lambda owner: self._stream(request, owner), raw_text=True)
+
+    async def _stream(self, request: LLMRequest, owner: CollectedLLMStream) -> AsyncIterator[LLMChunk]:
         payload = self._build_payload(request)
         headers = self._headers()
         url = f"{self._base_url}/v1/messages"
 
         produced = False  # 是否已向消费者吐过 chunk（流已开始）
         for attempt in range(self._max_http_retries):
-            tool_blocks: dict[int, dict[str, Any]] = {}
-            thinking_blocks: dict[int, str] = {}
+            state = owner.new_attempt()
             input_tokens: int | None = None
             cache_read = 0
             cache_write = 0
-            content_text = ""
             finish_reason: str | None = None
             usage: LLMUsage | None = None
-            gate = ContentGate()  # 增量剥离 <think>/<tool_call> 标签
 
             try:
                 # 流式 read 超时 = 闲置(自上一字节起)超时,而非整段时长上限:正常流(token/思考/
@@ -186,13 +185,9 @@ class AnthropicAdapter(LLMClient):
                             idx = event.get("index", 0)
                             block_type = block.get("type", "")
                             if block_type == "tool_use":
-                                tool_blocks[idx] = {
-                                    "id": block.get("id", ""),
-                                    "name": block.get("name", ""),
-                                    "arguments": "",
-                                }
+                                state.feed_tool(idx, call_id=block.get("id", ""), name=block.get("name", ""), reset=True)
                             elif block_type == "thinking":
-                                thinking_blocks[idx] = ""
+                                state.start_thinking(idx)
 
                         elif event_type == "content_block_delta":
                             delta = event.get("delta") or {}
@@ -202,8 +197,7 @@ class AnthropicAdapter(LLMClient):
                             if delta_type == "text_delta":
                                 text = delta.get("text") or ""
                                 if text:
-                                    content_text = _merge_content(content_text, text)
-                                    tok = gate.feed(content_text)
+                                    tok = state.feed_text(text)
                                     if tok:
                                         produced = True
                                         yield LLMChunk(kind="token", text=tok)
@@ -211,22 +205,26 @@ class AnthropicAdapter(LLMClient):
                             elif delta_type == "thinking_delta":
                                 thinking = delta.get("thinking") or ""
                                 if thinking:
-                                    thinking_blocks[idx] = thinking_blocks.get(idx, "") + thinking
                                     produced = True
-                                    yield LLMChunk(kind="reasoning", text=thinking)
+                                    yield LLMChunk(kind="reasoning", text=thinking, reasoning_index=idx)
+
+                            elif delta_type == "signature_delta":
+                                state.signature(idx, delta.get("signature") or "")
 
                             elif delta_type == "input_json_delta":
                                 partial = delta.get("partial_json") or ""
-                                if idx in tool_blocks:
+                                if idx in state.tool_buffers:
                                     # merge_content：兼容增量与「字符级前缀重发」两种流式语义，
                                     # 避免重发被盲拼成畸形（同 content 的 N5 防御）。
-                                    tool_blocks[idx]["arguments"] = _merge_content(
-                                        tool_blocks[idx]["arguments"], partial)
+                                    state.feed_tool(idx, arguments=partial)
                                     # 见 openai.py：工具调用参数流式期间发无负载心跳，让 act 流式
                                     # 循环顶部的暂停/取消检查点有机会运行；并标记 produced 使断流走
                                     # retriable（任务层干净整跑），而非静默 inline 重发整个长工具调用。
                                     produced = True
                                     yield LLMChunk(kind="tool_call_partial")
+
+                        elif event_type == "content_block_stop":
+                            state.stop_block(event.get("index", 0))
 
                         elif event_type == "message_delta":
                             stop_reason = event.get("delta", {}).get("stop_reason")
@@ -259,13 +257,13 @@ class AnthropicAdapter(LLMClient):
                     # 流以任何方式结束（message_delta / 自然结束）→ 统一收尾：
                     # 截断判定、native 规整、文本/思考还原、usage、done（见 _finalize）。
                     for ch in build_finalize_chunks(
-                        content_text=content_text,
-                        native_tool_calls=_parse_tool_blocks(tool_blocks),
-                        had_native_buffer=bool(tool_blocks),
+                        content_text=state.content_text,
+                        native_tool_calls=_parse_tool_blocks(state.tool_buffers),
+                        had_native_buffer=bool(state.tool_buffers),
                         saw_terminal=finish_reason is not None,
                         usage=usage,
                         finish_reason=finish_reason,
-                        emitted_visible_len=gate.emitted_len,
+                        emitted_visible_len=state.gate.emitted_len,
                     ):
                         yield ch
                     return
@@ -276,7 +274,7 @@ class AnthropicAdapter(LLMClient):
                 if produced:
                     logger.warning(
                         "Anthropic stream interrupted mid-flight (tool_call_in_progress=%s): %s",
-                        bool(tool_blocks), exc,
+                        bool(state.tool_buffers), exc,
                     )
                     raise LLMCallError(
                         f"LLM stream interrupted mid-flight: {exc}", retriable=True, outage=True,
@@ -374,7 +372,9 @@ def _serialize_messages(messages: list[LLMMessage]) -> list[dict[str, Any]]:
             i += 1
             continue
         if m.role == "assistant":
-            content_blocks: list[dict] = []
+            # Signed thinking belongs to this assistant message, not the shared adapter.
+            thinking = m.provider_state.get("anthropic", {}).get("thinking_blocks", [])
+            content_blocks: list[dict] = [dict(block) for block in thinking] if m.tool_calls else []
             if isinstance(m.content, str):
                 if m.content:
                     content_blocks.append({"type": "text", "text": m.content})

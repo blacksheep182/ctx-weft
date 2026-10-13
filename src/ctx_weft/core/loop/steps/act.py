@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ctx_weft.protocols import LLMMessage, LLMRequest, LLMUsage, ToolCall
+from ctx_weft.providers.llm.stream import ensure_collected_stream
 from ctx_weft.core.loop.driver import (
     ACT_TURNS_USED_KEY, COMPACT_NOOP_KEY, CONTEXT_RECOVERY_COUNT_KEY,
     HOT_REPLY_ROUND_KEY, RECOGNIZE_INTENT_PENDING_KEY, ROUND_COMMITTED_KEY,
@@ -112,7 +113,7 @@ class ActStep(Step):
             state.extra["assistant_record_id"] = persisted_turn.record_id
             current_messages.append(LLMMessage(
                 role="assistant", content=turn.text, tool_calls=asst_tool_dicts,
-                reasoning_content=turn.reasoning or None))
+                reasoning_content=turn.reasoning or None, provider_state=turn.provider_state))
             turn_record = TurnRecord(
                 turn=turn_num, messages_sent=list(current_messages),
                 assistant_text=turn.text, tool_calls=turn.tool_calls, usage=turn.usage)
@@ -454,6 +455,7 @@ class _LLMTurnOutput:
     # tool_calls 内的 id 已是内部标识；minted 保留原始 wire id / ordinal 供落库伴随字段。
     anchor: str = ""
     minted: list[MintedCall] = dataclasses.field(default_factory=list)
+    provider_state: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 async def _run_llm_turn(
@@ -482,41 +484,28 @@ async def _run_llm_turn(
     # PROMPT_EST_BASE_KEY/PROMPT_EST_SEG_KEY 的做法），不新增函数参数。
     llm_request.metadata["turn"] = turn_num
 
-    text = ""
-    reasoning = ""
-    tool_calls: list[ToolCall] = []
-    usage = LLMUsage()
     interrupted = False
+    stream = ensure_collected_stream(stream_llm_resilient(ctx, state, llm_request))
 
-    async for chunk in _stream_until_stop(
-        stream_llm_resilient(ctx, state, llm_request), ctx,
-    ):
-        tok = ctx.cancel_token
-        if _interrupt_pending(ctx):
-            interrupted = True          # ② 软打断：停收 token，下面提交半截
-            break
-        if tok is not None and tok.is_cancelled:
-            tok.raise_if_cancelled()    # 硬取消 → CancelledError
-        # ── 提交点：本轮第一个 chunk ──────────────────────────────────────────
-        # 「一轮对话直到 LLM 真的开口才算发生」（spec 2026-09-09）。判据是**任意
-        # chunk**，不是第一个 token：模型第一句就调工具、一个字都不吐的回合很常见，
-        # 那种回合 `chunk.kind` 恒不是 "token"，等 token 就是永远等不到、整轮永不提交。
-        # 这也正是 gateway 内部 `yielded_anything` 的那条界（首 chunk 之前失败可重试、
-        # 之后断流直接抛 outage）——同一条界，这里把它从 gateway 的局部规则升成整轮的。
-        await _commit_round(state, ctx)
-        if chunk.kind == "token":
-            ctx.run_phase.produced = True
-            text += chunk.text
-        elif chunk.kind == "reasoning":
-            reasoning += chunk.text
-        elif chunk.kind == "tool_call" and chunk.tool_call is not None:
-            tool_calls.append(chunk.tool_call)
-        elif chunk.kind == "tool_call_partial":
-            # 工具调用参数流式期间的心跳：不携带数据，仅为让上面的暂停/取消检查点
-            # 有机会触发（adapter 累积工具调用参数时不产出 token）。此处刻意不累积。
-            pass
-        elif chunk.kind == "usage" and chunk.usage is not None:
-            usage = chunk.usage
+    try:
+        async for chunk in _stream_until_stop(stream, ctx):
+            tok = ctx.cancel_token
+            if _interrupt_pending(ctx):
+                interrupted = True
+                break
+            if tok is not None and tok.is_cancelled:
+                tok.raise_if_cancelled()
+            # Preserve the original commit/accept boundary, including tool heartbeats.
+            await _commit_round(state, ctx)
+            if chunk.kind == "token":
+                ctx.run_phase.produced = True
+            stream.accept_current()
+    finally:
+        await stream.aclose()
+
+    result = stream.partial_result()
+    text, reasoning, usage = result.text, result.reasoning, result.usage
+    tool_calls = list(result.tool_calls)
 
     # 流在**首个 chunk 到达之前**被停止信号掐断时，上面的循环体一次都没执行到——
     # 判定必须补在循环之后，否则一次 TTFT 窗口里的暂停会被当成「流正常结束」。
@@ -582,7 +571,7 @@ async def _run_llm_turn(
 
     return _LLMTurnOutput(
         text=text, reasoning=reasoning, tool_calls=tool_calls, usage=usage,
-        anchor=anchor, minted=minted)
+        anchor=anchor, minted=minted, provider_state=result.provider_state)
 
 
 def _can_recover_context(state: LoopState) -> bool:
@@ -934,7 +923,7 @@ async def _invoke_tool(tc: ToolCall, state: LoopState, ctx: LoopContext) -> Any:
         )
 
     # 降级：无 gateway 时的最简路径（保持向后兼容）
-    from ctx_weft.core.loop.capability_gateway import CapabilityGateway, InvocationResult
+    from ctx_weft.core.loop.capability_gateway import InvocationResult
     logger.warning("No CapabilityGateway in LoopContext; tool '%s' cannot be dispatched", tc.name)
     return InvocationResult(
         invocation_id="noop",

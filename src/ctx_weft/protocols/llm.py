@@ -108,6 +108,9 @@ class LLMMessage:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str | None = None
     reasoning_content: str | None = None  # 部分模型支持的"内部推理"内容
+    # Request-local continuation data (e.g. signed Anthropic thinking blocks).
+    # Not part of front-end events or persistent conversation storage.
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """把 dict 形态的 content 归一回 ContentPart dataclass（多模态 Phase 3c Task E2）。
@@ -243,6 +246,38 @@ class LLMChunk:
     tool_call: ToolCall | None = None
     usage: LLMUsage | None = None
     finish_reason: str | None = None
+    reasoning_index: int | None = None  # optional provider content-block identity
+
+
+@dataclass(frozen=True)
+class LLMStreamResult:
+    """A completed/accepted snapshot. Callers treat its values as read-only."""
+
+    text: str = ""
+    reasoning: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    usage: LLMUsage = field(default_factory=LLMUsage)
+    finish_reason: str | None = None
+    provider_state: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class LLMStream(Protocol):
+    """One reader, one per-request result owner; result access never reads the network."""
+
+    def __aiter__(self) -> LLMStream: ...
+    async def __anext__(self) -> LLMChunk: ...
+    def accept_current(self) -> None: ...
+    def partial_result(self) -> LLMStreamResult: ...
+    def get_final_result(self) -> LLMStreamResult: ...
+    async def aclose(self) -> None: ...
+
+
+@runtime_checkable
+class StreamingLLMClient(Protocol):
+    """Optional extension; legacy complete-only clients remain supported."""
+
+    def open_stream(self, request: LLMRequest, stream: bool = True) -> LLMStream: ...
 
 
 # ══════════════════════════════════════════════════════════════════════════════
